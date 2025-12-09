@@ -103,12 +103,23 @@ class DeepSeekOCRVLLMGUI:
         model_frame.grid(row=1, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=5)
         
         ttk.Label(model_frame, text="模型路径:").grid(row=0, column=0, sticky=tk.W, padx=5)
-        self.model_path_var = tk.StringVar(value="deepseek-ai/DeepSeek-OCR")
+        
+        # 检测本地模型
+        local_model_path = "./models/DeepSeek-OCR"
+        if os.path.exists(local_model_path):
+            default_model = local_model_path
+            self.log(f"✓ 检测到本地模型: {local_model_path}")
+        else:
+            default_model = "deepseek-ai/DeepSeek-OCR"
+        
+        self.model_path_var = tk.StringVar(value=default_model)
         model_entry = ttk.Entry(model_frame, textvariable=self.model_path_var, width=50)
         model_entry.grid(row=0, column=1, sticky=(tk.W, tk.E), padx=5)
         
         self.load_model_btn = ttk.Button(model_frame, text="加载模型", command=self.load_model)
         self.load_model_btn.grid(row=0, column=2, padx=5)
+        
+        ttk.Button(model_frame, text="📁", command=self.browse_model_path, width=3).grid(row=0, column=3, padx=2)
         
         self.model_status_label = ttk.Label(model_frame, text="状态: 未加载", foreground="red")
         self.model_status_label.grid(row=0, column=3, padx=5)
@@ -253,6 +264,22 @@ class DeepSeekOCRVLLMGUI:
     def clear_log(self):
         """清空日志"""
         self.log_text.delete(1.0, tk.END)
+    
+    def browse_model_path(self):
+        """浏览选择本地模型目录"""
+        directory = filedialog.askdirectory(
+            title="选择模型文件夹",
+            initialdir="./models" if os.path.exists("./models") else "."
+        )
+        if directory:
+            self.model_path_var.set(directory)
+            self.log(f"已选择模型路径: {directory}")
+            # 检查模型文件是否存在
+            config_file = os.path.join(directory, "config.json")
+            if os.path.exists(config_file):
+                self.log("✓ 模型文件验证成功")
+            else:
+                self.log("⚠ 警告: 未找到 config.json，这可能不是有效的模型目录")
         
     def on_input_type_change(self):
         """输入类型改变时更新按钮文本"""
@@ -339,13 +366,26 @@ class DeepSeekOCRVLLMGUI:
                 self.load_model_btn.config(state=tk.DISABLED)
                 model_path = self.model_path_var.get()
                 
+                # 检查模型路径是否存在（本地模型）
+                if os.path.exists(model_path):
+                    self.log(f"✓ 使用本地模型: {model_path}")
+                    self.log("离线模式：不需要网络连接")
+                else:
+                    self.log(f"模型路径: {model_path}")
+                    self.log("⚠ 在线模式：将从 HuggingFace 下载模型")
+                    self.log("如需离线使用，请先下载模型到本地")
+                
                 # 设置CUDA设备
                 os.environ["CUDA_VISIBLE_DEVICES"] = '0'
+                
+                # 设置离线模式（如果是本地路径）
+                if os.path.exists(model_path):
+                    os.environ["HF_HUB_OFFLINE"] = "1"
+                    os.environ["TRANSFORMERS_OFFLINE"] = "1"
                 
                 if self.use_vllm:
                     # 使用 vLLM
                     self.log("开始加载 vLLM 模型...")
-                    self.log(f"模型路径: {model_path}")
                     self.log("初始化 vLLM 引擎 (这可能需要几分钟)...")
                     
                     self.llm = LLM(
@@ -369,19 +409,20 @@ class DeepSeekOCRVLLMGUI:
                 else:
                     # 使用 HuggingFace Transformers
                     self.log("开始加载 HuggingFace 模型...")
-                    self.log(f"模型路径: {model_path}")
                     
                     self.log("加载 tokenizer...")
                     self.tokenizer = AutoTokenizer.from_pretrained(
                         model_path, 
-                        trust_remote_code=True
+                        trust_remote_code=True,
+                        local_files_only=os.path.exists(model_path)
                     )
                     
                     self.log("加载模型 (这可能需要几分钟)...")
                     self.model = AutoModel.from_pretrained(
                         model_path,
                         trust_remote_code=True, 
-                        use_safetensors=True
+                        use_safetensors=True,
+                        local_files_only=os.path.exists(model_path)
                     )
                     
                     # 检查CUDA是否可用
@@ -399,11 +440,35 @@ class DeepSeekOCRVLLMGUI:
                 self.run_btn.config(state=tk.NORMAL)
                 
             except Exception as e:
-                self.log(f"加载模型失败: {str(e)}")
-                import traceback
-                self.log(traceback.format_exc())
+                error_msg = str(e)
+                self.log(f"加载模型失败: {error_msg}")
+                
+                # 检查是否是网络连接问题
+                if "Connection" in error_msg or "timeout" in error_msg or "huggingface.co" in error_msg:
+                    self.log("\n❌ 网络连接失败！")
+                    self.log("\n解决方案:")
+                    self.log("1. 使用本地模型（推荐）:")
+                    self.log("   - 运行 download_model.bat 下载模型")
+                    self.log("   - 将模型路径改为: ./models/DeepSeek-OCR")
+                    self.log("\n2. 配置代理或镜像:")
+                    self.log("   - 设置 HF_ENDPOINT 环境变量")
+                    self.log("\n3. 使用 VPN 访问 huggingface.co")
+                    
+                    messagebox.showerror(
+                        "网络连接失败", 
+                        "无法连接到 huggingface.co\n\n"
+                        "建议：\n"
+                        "1. 先在有网络的电脑上运行 download_model.bat\n"
+                        "2. 将下载的 models 文件夹复制到本程序目录\n"
+                        "3. 模型路径改为: ./models/DeepSeek-OCR\n"
+                        "4. 重新加载模型"
+                    )
+                else:
+                    import traceback
+                    self.log(traceback.format_exc())
+                    messagebox.showerror("错误", f"加载模型失败:\n{error_msg}")
+                
                 self.model_status_label.config(text="状态: 加载失败", foreground="red")
-                messagebox.showerror("错误", f"加载模型失败:\n{str(e)}")
             finally:
                 self.load_model_btn.config(state=tk.NORMAL)
     def process_single_image(self, image_path, output_path):
