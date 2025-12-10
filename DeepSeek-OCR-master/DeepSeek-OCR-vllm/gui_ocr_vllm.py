@@ -5,52 +5,182 @@ import os
 import sys
 import re
 import subprocess
+import logging
 from pathlib import Path
 from PIL import Image, ImageTk, ImageDraw, ImageFont
 import torch
 
-# 检查是否可以导入 vLLM
+# ============ 重要：必须在导入 vLLM 之前设置环境变量 ============
+os.environ['VLLM_USE_V1'] = '0'
+os.environ["CUDA_VISIBLE_DEVICES"] = '0'
+
+# CUDA 版本特定配置
+if torch.version.cuda == '11.8':
+    os.environ["TRITON_PTXAS_PATH"] = "/usr/local/cuda-11.8/bin/ptxas"
+
+# ============ 日志系统配置 ============
+# 创建日志记录器（用于后台详细日志）
+logger = logging.getLogger("DeepSeekOCR")
+logger.setLevel(logging.DEBUG)
+
+# 文件日志处理器（详细技术日志）
+log_file = "deepseek_ocr_debug.log"
+file_handler = logging.FileHandler(log_file, encoding='utf-8')
+file_handler.setLevel(logging.DEBUG)
+file_formatter = logging.Formatter(
+    '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+file_handler.setFormatter(file_formatter)
+logger.addHandler(file_handler)
+
+# 控制台日志处理器（系统初始化时打印）
+console_handler = logging.StreamHandler()
+console_handler.setLevel(logging.INFO)
+console_formatter = logging.Formatter('%(levelname)s: %(message)s')
+console_handler.setFormatter(console_formatter)
+logger.addHandler(console_handler)
+
+# ============ 硬件检测函数 ============
+def detect_gpu_driver():
+    """
+    检测 NVIDIA GPU 驱动（用于 EXE 分发）
+    注意：比检查 CUDA 版本更靠谱，因为驱动和 GPU 计算能力关系更直接
+    """
+    gpu_driver_info = {
+        "driver_installed": False,
+        "driver_version": "未知",
+    }
+    
+    # 尝试查询 NVIDIA 驱动
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader"],
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        if result.returncode == 0:
+            driver_version = result.stdout.strip()
+            if driver_version:
+                gpu_driver_info["driver_installed"] = True
+                gpu_driver_info["driver_version"] = driver_version
+    except Exception as e:
+        pass  # nvidia-smi 不可用
+    
+    return gpu_driver_info
+
+def detect_hardware():
+    """
+    检测系统硬件配置（针对 EXE 离线分发优化）
+    
+    对于 EXE 分发：
+    - 检查 GPU 硬件是否存在
+    - 检查驱动而不是 CUDA 版本（驱动更稳定）
+    - 不强制依赖特定 CUDA 版本
+    """
+    gpu_driver_info = detect_gpu_driver()
+    
+    hardware_info = {
+        # GPU 硬件
+        "cuda_available": torch.cuda.is_available(),
+        "gpu_count": torch.cuda.device_count() if torch.cuda.is_available() else 0,
+        "gpu_name": "",
+        "gpu_memory_gb": "0",
+        
+        # 驱动信息（用于 EXE 分发）
+        "driver_available": gpu_driver_info["driver_installed"],
+        "driver_version": gpu_driver_info["driver_version"],
+        
+        # CUDA/cuDNN 信息（可选，仅供参考）
+        "cuda_version": torch.version.cuda,
+        "cudnn_version": torch.backends.cudnn.version() if torch.cuda.is_available() else None,
+    }
+    
+    if hardware_info["cuda_available"] and hardware_info["gpu_count"] > 0:
+        try:
+            hardware_info["gpu_name"] = torch.cuda.get_device_name(0)
+            gpu_memory = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
+            hardware_info["gpu_memory_gb"] = f"{gpu_memory:.2f}"
+        except:
+            hardware_info["gpu_memory_gb"] = "未知"
+    
+    return hardware_info
+
+# 检测硬件信息
+HARDWARE_INFO = detect_hardware()
+
+# ============ 推理引擎选择逻辑（针对 EXE 离线分发） ============
+# 
+# 策略说明：
+# 1. 对于 CPU-Only 版本：使用 HuggingFace Transformers（推荐分发）
+# 2. 对于 GPU 版本：检查驱动而不是 CUDA 版本
+# 3. 仅在有 GPU 驱动时才尝试加载 vLLM
+
 VLLM_AVAILABLE = False
 HF_AVAILABLE = False
 
-# 尝试导入 vLLM
-try:
-    if torch.version.cuda == '11.8':
-        os.environ["TRITON_PTXAS_PATH"] = "/usr/local/cuda-11.8/bin/ptxas"
-    os.environ['VLLM_USE_V1'] = '0'
-    
-    from vllm import LLM, SamplingParams
-    from vllm.model_executor.models.registry import ModelRegistry
-    from deepseek_ocr import DeepseekOCRForCausalLM
-    from process.ngram_norepeat import NoRepeatNGramLogitsProcessor
-    from process.image_process import DeepseekOCRProcessor
-    
-    ModelRegistry.register_model("DeepseekOCRForCausalLM", DeepseekOCRForCausalLM)
-    VLLM_AVAILABLE = True
-    print("✓ vLLM 加载成功")
-except Exception as e:
-    print(f"⚠ vLLM 不可用: {e}")
-    print("尝试使用 HuggingFace Transformers 作为备用方案...")
+# ============ 决策逻辑 ============
+# 默认使用 Transformers（CPU 友好）
+# 仅当有 GPU 驱动时才考虑 vLLM
 
-# 如果 vLLM 不可用，尝试 HuggingFace
+SHOULD_TRY_VLLM = HARDWARE_INFO["driver_available"] and HARDWARE_INFO["cuda_available"]
+
+print("\n" + "="*70)
+print("推理引擎初始化")
+print("="*70)
+
+# 尝试导入 vLLM（仅在有 GPU 时）
+if SHOULD_TRY_VLLM:
+    print(f"✓ 检测到 GPU 驱动: v{HARDWARE_INFO['driver_version']}")
+    print("尝试加载 vLLM（高性能推理）...")
+    
+    try:
+        # 环境变量已在文件开头设置
+        from vllm import LLM, SamplingParams
+        from vllm.model_executor.models.registry import ModelRegistry
+        from deepseek_ocr import DeepseekOCRForCausalLM
+        from process.ngram_norepeat import NoRepeatNGramLogitsProcessor
+        from process.image_process import DeepseekOCRProcessor
+        
+        ModelRegistry.register_model("DeepseekOCRForCausalLM", DeepseekOCRForCausalLM)
+        VLLM_AVAILABLE = True
+        print("✓ vLLM 加载成功")
+        
+    except Exception as e:
+        print(f"⚠ vLLM 加载失败: {e}")
+        print("降级到 HuggingFace Transformers...")
+else:
+    if HARDWARE_INFO["cuda_available"]:
+        print("✓ 检测到 GPU，但未检测到 NVIDIA 驱动")
+        print("  建议：安装 NVIDIA 驱动以获得更好的性能")
+        print("  使用 CPU 模式...")
+    else:
+        print("✓ 使用 CPU 模式（未检测到 GPU）")
+
+# 如果 vLLM 不可用，使用 HuggingFace Transformers
 if not VLLM_AVAILABLE:
     try:
         from transformers import AutoModel, AutoTokenizer
         HF_AVAILABLE = True
-        print("✓ 将使用 HuggingFace Transformers")
+        print("✓ 使用 HuggingFace Transformers")
+        if HARDWARE_INFO["cuda_available"]:
+            print("  模式: GPU 加速")
+        else:
+            print("  模式: CPU 推理")
     except Exception as e:
-        print(f"✗ HuggingFace Transformers 也不可用: {e}")
-        print("\n请安装必要的依赖:")
+        print(f"✗ 导入失败: {e}")
+        print("\n请确保已安装依赖包：")
         print("  pip install transformers")
         input("\n按任意键退出...")
         sys.exit(1)
 
 if not VLLM_AVAILABLE and not HF_AVAILABLE:
     print("✗ 无法导入任何推理引擎！")
-    print("\n请安装以下依赖之一:")
-    print("  pip install transformers  # 推荐，兼容性好")
     input("\n按任意键退出...")
     sys.exit(1)
+
+print("="*70 + "\n")
 
 
 import fitz  # PyMuPDF
@@ -64,6 +194,9 @@ class DeepSeekOCRVLLMGUI:
         self.root.title(f"DeepSeek OCR GUI ({engine_name})")
         self.root.geometry("1200x800")
         
+        # 硬件信息
+        self.hardware_info = HARDWARE_INFO
+        
         # 模型相关变量
         self.llm = None
         self.model = None
@@ -71,6 +204,7 @@ class DeepSeekOCRVLLMGUI:
         self.model_loaded = False
         self.processing = False
         self.use_vllm = VLLM_AVAILABLE
+        self.use_gpu = HARDWARE_INFO["cuda_available"]
         
         if VLLM_AVAILABLE:
             self.processor = DeepseekOCRProcessor()
@@ -78,9 +212,59 @@ class DeepSeekOCRVLLMGUI:
         # 创建界面
         self.create_widgets()
         
-        # 显示引擎信息
-        if not VLLM_AVAILABLE:
-            self.log("⚠ 注意: vLLM 不可用，使用 HuggingFace Transformers（速度较慢但功能完整）")
+        # 显示硬件和引擎信息
+        self.show_hardware_info()
+    
+    def show_hardware_info(self):
+        """显示硬件和推理引擎信息（针对 EXE 分发优化）"""
+        self.log("\n" + "="*70, "info")
+        self.log("💻 系统硬件检测", "info")
+        self.log("="*70, "info")
+        
+        # GPU 驱动信息（最重要）
+        self.log("\n【GPU 加速状态】", "info")
+        if self.hardware_info["driver_available"]:
+            self.log(f"✅ NVIDIA 驱动已安装", "info")
+            self.log(f"   驱动版本: {self.hardware_info['driver_version']}", "info", show_in_gui=False)
+        else:
+            self.log("❌ NVIDIA 驱动未检测到", "info")
+            if self.hardware_info["cuda_available"]:
+                self.log("   💡 你的电脑有 GPU，但需要安装驱动来加速运算", "info")
+                self.log("   📍 建议: 访问 https://www.nvidia.com/drivers 下载驱动", "info")
+            else:
+                self.log("   ℹ️  你的电脑没有 NVIDIA GPU，将使用 CPU（速度较慢）", "info")
+        
+        # GPU 硬件信息
+        self.log("\n【硬件配置】", "info")
+        if self.hardware_info["cuda_available"] and self.hardware_info["gpu_count"] > 0:
+            self.log(f"✅ GPU: {self.hardware_info['gpu_name']}", "info")
+            self.log(f"   显存: {self.hardware_info['gpu_memory_gb']} GB", "info", show_in_gui=False)
+        else:
+            self.log("ℹ️  使用 CPU 处理（建议配置: 8GB RAM 以上）", "info")
+        
+        # 推理引擎信息
+        self.log("\n【推理引擎】", "info")
+        if VLLM_AVAILABLE:
+            self.log("⚡ vLLM（快速推理）", "info")
+            self.log("   推理速度: 非常快 (~100+ tokens/秒)", "info")
+            self.log("   适用场景: 日常使用，大批量处理", "info")
+        elif HF_AVAILABLE:
+            if self.use_gpu:
+                self.log("🚀 GPU 加速推理", "info")
+                self.log("   推理速度: 中等 (~20-50 tokens/秒)", "info")
+            else:
+                self.log("🐢 CPU 推理（较慢）", "info")
+                self.log("   推理速度: 较慢 (~2-5 tokens/秒)", "info")
+                self.log("   ⏱️  一张 A4 纸可能需要 1-3 分钟", "info")
+        
+        # 详细技术信息只输出到日志文件
+        if self.hardware_info["cuda_available"]:
+            logger.info(f"CUDA 版本: {self.hardware_info['cuda_version']}")
+            if self.hardware_info['cudnn_version']:
+                logger.info(f"cuDNN 版本: {self.hardware_info['cudnn_version']}")
+        
+        self.log("="*70 + "\n", "info")
+        self.log("✨ 准备就绪！请点击\"加载模型\"开始使用\n", "info")
         
     def create_widgets(self):
         # 主框架
@@ -108,9 +292,10 @@ class DeepSeekOCRVLLMGUI:
         local_model_path = "./models/DeepSeek-OCR"
         if os.path.exists(local_model_path):
             default_model = local_model_path
-            self.log(f"✓ 检测到本地模型: {local_model_path}")
+            self.local_model_detected = True
         else:
             default_model = "deepseek-ai/DeepSeek-OCR"
+            self.local_model_detected = False
         
         self.model_path_var = tk.StringVar(value=default_model)
         model_entry = ttk.Entry(model_frame, textvariable=self.model_path_var, width=50)
@@ -181,6 +366,14 @@ class DeepSeekOCRVLLMGUI:
             "<image>\nDescribe this image in detail."
         )
         prompt_combo.grid(row=3, column=1, columnspan=2, sticky=(tk.W, tk.E), padx=5)
+        
+        # 提示词帮助按钮
+        ttk.Button(
+            input_frame, 
+            text="❓ 帮助", 
+            command=self.show_prompt_help,
+            width=6
+        ).grid(row=3, column=3, sticky=tk.W, padx=2)
         
         input_frame.columnconfigure(1, weight=1)
         
@@ -255,11 +448,36 @@ class DeepSeekOCRVLLMGUI:
         self.log_text = scrolledtext.ScrolledText(log_frame, height=20, wrap=tk.WORD)
         self.log_text.pack(fill=tk.BOTH, expand=True)
         
-    def log(self, message):
-        """添加日志信息"""
-        self.log_text.insert(tk.END, f"{message}\n")
-        self.log_text.see(tk.END)
-        self.root.update_idletasks()
+        # 在日志创建后输出本地模型检测信息
+        if hasattr(self, 'local_model_detected') and self.local_model_detected:
+            self.log(f"✓ 检测到本地模型: ./models/DeepSeek-OCR")
+        
+    def log(self, message, level="info", show_in_gui=True):
+        """
+        双层日志系统：
+        - GUI 界面显示用户友好的信息
+        - 后台详细日志记录技术信息
+        
+        参数：
+            message: 日志消息
+            level: 日志级别 ("debug", "info", "warning", "error")
+            show_in_gui: 是否在 GUI 中显示（False 时只记录到文件）
+        """
+        # 后台详细日志（技术人员查看）
+        if level == "debug":
+            logger.debug(message)
+        elif level == "warning":
+            logger.warning(message)
+        elif level == "error":
+            logger.error(message)
+        else:
+            logger.info(message)
+        
+        # GUI 显示用户友好的信息
+        if show_in_gui:
+            self.log_text.insert(tk.END, f"{message}\n")
+            self.log_text.see(tk.END)
+            self.root.update_idletasks()
         
     def clear_log(self):
         """清空日志"""
@@ -355,6 +573,46 @@ class DeepSeekOCRVLLMGUI:
             self.base_size_var.set(base_size)
             self.image_size_var.set(image_size)
             self.crop_mode_var.set(crop_mode)
+    
+    def show_prompt_help(self):
+        """显示提示词帮助信息"""
+        help_text = """
+【提示词 (Prompt) 说明】
+
+提示词是告诉 AI 你想要什么的指令。以下是常用提示词：
+
+1️⃣ 转换为 Markdown 格式（推荐）
+   <image>
+   <|grounding|>Convert the document to markdown.
+   👉 用途：将文档转为 Markdown 格式
+   
+2️⃣ 自由 OCR 识别
+   <image>
+   Free OCR.
+   👉 用途：提取文本内容
+   
+3️⃣ 详细 OCR 识别
+   <image>
+   <|grounding|>OCR this image.
+   👉 用途：精确识别每个字符
+   
+4️⃣ 解析图表
+   <image>
+   Parse the figure.
+   👉 用途：识别图表和数据
+   
+5️⃣ 描述图像
+   <image>
+   Describe this image in detail.
+   👉 用途：生成详细的图像描述
+
+📌 提示：
+• <image> 是固定的，代表你要识别的图片
+• 选择合适的提示词能获得更好的识别效果
+• 默认推荐"Convert to markdown"
+"""
+        messagebox.showinfo("提示词帮助", help_text)
+    
     def load_model(self):
         """加载模型（vLLM或HF）"""
         if self.model_loaded:
@@ -368,12 +626,15 @@ class DeepSeekOCRVLLMGUI:
                 
                 # 检查模型路径是否存在（本地模型）
                 if os.path.exists(model_path):
-                    self.log(f"✓ 使用本地模型: {model_path}")
-                    self.log("离线模式：不需要网络连接")
+                    self.log(f"📂 使用本地模型: {model_path}", "info")
+                    self.log("✅ 离线模式（无需网络连接）", "info")
                 else:
-                    self.log(f"模型路径: {model_path}")
-                    self.log("⚠ 在线模式：将从 HuggingFace 下载模型")
-                    self.log("如需离线使用，请先下载模型到本地")
+                    self.log(f"🔄 模型路径: {model_path}", "info")
+                    self.log("⚠️  在线模式（需要网络下载，可能较慢）", "info")
+                
+                # 详细日志输出到文件
+                logger.debug(f"模型加载路径: {model_path}")
+                logger.debug(f"CUDA 设备: {os.environ.get('CUDA_VISIBLE_DEVICES', '0')}")
                 
                 # 设置CUDA设备
                 os.environ["CUDA_VISIBLE_DEVICES"] = '0'
@@ -385,8 +646,13 @@ class DeepSeekOCRVLLMGUI:
                 
                 if self.use_vllm:
                     # 使用 vLLM
-                    self.log("开始加载 vLLM 模型...")
-                    self.log("初始化 vLLM 引擎 (这可能需要几分钟)...")
+                    self.log("\n⏳ 正在加载模型（这可能需要几分钟）...", "info")
+                    self.log("💡 初始化推理引擎...", "info", show_in_gui=False)
+                    
+                    # 检查 GPU 是否可用
+                    if not self.use_gpu:
+                        self.log("⚠️  警告: GPU 驱动未检测到", "warning")
+                        self.log("       vLLM 可能无法运行，建议安装 NVIDIA 驱动", "warning")
                     
                     self.llm = LLM(
                         model=model_path,
@@ -399,25 +665,28 @@ class DeepSeekOCRVLLMGUI:
                         max_num_seqs=self.max_concurrency_var.get(),
                         tensor_parallel_size=1,
                         gpu_memory_utilization=self.gpu_util_var.get(),
+                        dtype="bfloat16",  # 明确指定数据类型，避免 float16/bfloat16 混用
                     )
                     
-                    self.model_status_label.config(text="状态: 已加载 (vLLM)", foreground="green")
-                    self.log("vLLM 模型加载成功！")
-                    self.log(f"GPU内存利用率: {self.gpu_util_var.get()}")
-                    self.log(f"最大并发数: {self.max_concurrency_var.get()}")
+                    self.model_status_label.config(text="✅ 已加载 (vLLM)", foreground="green")
+                    self.log("✅ 模型加载成功！", "info")
+                    self.log(f"⚡ 推理模式: vLLM（高速）", "info")
+                    
+                    # 详细配置信息到日志文件
+                    logger.info(f"GPU内存利用率: {self.gpu_util_var.get()}")
+                    logger.info(f"最大并发数: {self.max_concurrency_var.get()}")
                     
                 else:
                     # 使用 HuggingFace Transformers
-                    self.log("开始加载 HuggingFace 模型...")
-                    
-                    self.log("加载 tokenizer...")
+                    self.log("\n⏳ 正在加载模型（这可能需要几分钟）...", "info")
+                    self.log("💡 加载 tokenizer...", "info", show_in_gui=False)
                     self.tokenizer = AutoTokenizer.from_pretrained(
                         model_path, 
                         trust_remote_code=True,
                         local_files_only=os.path.exists(model_path)
                     )
                     
-                    self.log("加载模型 (这可能需要几分钟)...")
+                    self.log("💡 加载模型权重...", "info", show_in_gui=False)
                     self.model = AutoModel.from_pretrained(
                         model_path,
                         trust_remote_code=True, 
@@ -426,51 +695,58 @@ class DeepSeekOCRVLLMGUI:
                     )
                     
                     # 检查CUDA是否可用
-                    if torch.cuda.is_available():
-                        self.log("CUDA 可用，将模型加载到 GPU...")
-                        self.model = self.model.eval().cuda().to(torch.bfloat16)
+                    if self.use_gpu:
+                        self.log("💡 正在加载到 GPU...", "info", show_in_gui=False)
+                        try:
+                            self.model = self.model.eval().cuda().to(torch.bfloat16)
+                            self.log("✅ 模型加载成功！", "info")
+                            self.log("⚡ 推理模式: GPU 加速", "info")
+                            self.log(f"   GPU: {self.hardware_info['gpu_name']}", "info", show_in_gui=False)
+                            logger.info("模型加载到 GPU，使用 bfloat16 精度")
+                        except RuntimeError as gpu_err:
+                            self.log(f"⚠️  GPU 加载失败，自动降级到 CPU", "warning")
+                            self.log(f"     错误: {str(gpu_err)[:50]}...", "debug", show_in_gui=False)
+                            self.model = self.model.eval()
+                            self.use_gpu = False
                     else:
-                        self.log("CUDA 不可用，使用 CPU (速度会较慢)...")
+                        self.log("✅ 模型加载成功！", "info")
+                        self.log("🐢 推理模式: CPU（较慢）", "info")
+                        self.log("   提示: 建议安装 NVIDIA 驱动以获得更快速度", "info")
                         self.model = self.model.eval()
                     
-                    self.model_status_label.config(text="状态: 已加载 (HF)", foreground="green")
-                    self.log("HuggingFace 模型加载成功！")
+                    self.model_status_label.config(text="✅ 已加载 (HF)", foreground="green")
                 
                 self.model_loaded = True
                 self.run_btn.config(state=tk.NORMAL)
+                self.log("\n✨ 现在可以开始处理文件了！", "info")
                 
             except Exception as e:
                 error_msg = str(e)
-                self.log(f"加载模型失败: {error_msg}")
+                self.log(f"\n❌ 加载失败", "error")
                 
                 # 检查是否是网络连接问题
                 if "Connection" in error_msg or "timeout" in error_msg or "huggingface.co" in error_msg:
-                    self.log("\n❌ 网络连接失败！")
-                    self.log("\n解决方案:")
-                    self.log("1. 使用本地模型（推荐）:")
-                    self.log("   - 运行 download_model.bat 下载模型")
-                    self.log("   - 将模型路径改为: ./models/DeepSeek-OCR")
-                    self.log("\n2. 配置代理或镜像:")
-                    self.log("   - 设置 HF_ENDPOINT 环境变量")
-                    self.log("\n3. 使用 VPN 访问 huggingface.co")
-                    
-                    messagebox.showerror(
-                        "网络连接失败", 
-                        "无法连接到 huggingface.co\n\n"
-                        "建议：\n"
-                        "1. 先在有网络的电脑上运行 download_model.bat\n"
-                        "2. 将下载的 models 文件夹复制到本程序目录\n"
-                        "3. 模型路径改为: ./models/DeepSeek-OCR\n"
-                        "4. 重新加载模型"
-                    )
+                    self.log("📡 原因: 网络连接失败", "error")
+                    self.log("\n💡 解决方案:", "info")
+                    self.log("1. 使用本地模型（推荐）:", "info")
+                    self.log("   • 先在有网络的电脑下载模型", "info")
+                    self.log("   • 将模型文件复制到 ./models 文件夹", "info")
+                    self.log("   • 重新加载", "info")
+                    self.log("2. 检查网络连接和防火墙", "info")
+                    self.log("3. 如需在线下载，请稍后重试", "info")
                 else:
-                    import traceback
-                    self.log(traceback.format_exc())
-                    messagebox.showerror("错误", f"加载模型失败:\n{error_msg}")
+                    self.log(f"📋 错误信息: {error_msg}", "error")
+                    logger.error(f"模型加载失败: {error_msg}", exc_info=True)
+                    self.log("💡 请查看程序目录下的 deepseek_ocr_debug.log 获取详细信息", "info")
                 
-                self.model_status_label.config(text="状态: 加载失败", foreground="red")
+                self.model_status_label.config(text="❌ 加载失败", foreground="red")
             finally:
                 self.load_model_btn.config(state=tk.NORMAL)
+        
+        # 在新线程中启动模型加载
+        thread = threading.Thread(target=load_thread, daemon=True)
+        thread.start()
+    
     def process_single_image(self, image_path, output_path):
         """处理单张图片"""
         self.log(f"加载图片: {image_path}")
@@ -536,6 +812,45 @@ class DeepSeekOCRVLLMGUI:
             self.log(f"结果已保存到: {output_path}/result.md")
         
         return result
+    
+    def pdf_to_images(self, pdf_path, dpi=144):
+        """
+        将PDF转换为高质量图像
+        使用与 run_dpsk_ocr_pdf.py 相同的实现
+        """
+        import fitz
+        import io
+        
+        self.log(f"打开PDF文件: {pdf_path}")
+        
+        images = []
+        pdf_document = fitz.open(pdf_path)
+        
+        self.log(f"PDF共 {pdf_document.page_count} 页，开始转换 (DPI={dpi})...")
+        
+        zoom = dpi / 72.0
+        matrix = fitz.Matrix(zoom, zoom)
+        
+        for page_num in range(pdf_document.page_count):
+            page = pdf_document[page_num]
+            
+            # 渲染为高质量图像
+            pixmap = page.get_pixmap(matrix=matrix, alpha=False)
+            Image.MAX_IMAGE_PIXELS = None
+            
+            # 转换为PNG格式
+            img_data = pixmap.tobytes("png")
+            img = Image.open(io.BytesIO(img_data))
+            
+            images.append(img)
+            
+            if (page_num + 1) % 10 == 0:
+                self.log(f"  已转换 {page_num + 1}/{pdf_document.page_count} 页")
+        
+        pdf_document.close()
+        self.log(f"✓ PDF转换完成，共 {len(images)} 页")
+        
+        return images
         
     def process_pdf(self, pdf_path, output_path):
         """处理PDF文件"""

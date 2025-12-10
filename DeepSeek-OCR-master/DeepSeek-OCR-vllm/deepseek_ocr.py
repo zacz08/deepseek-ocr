@@ -279,7 +279,7 @@ class DeepseekOCRForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
 
         self.vision_config = config.vision_config
         self.projector_config = config.projector_config
-        self.text_config = config.text_config
+        self.text_config = config.get_text_config()
 
         model_config = vllm_config.model_config
         tokenizer = cached_tokenizer_from_config(model_config)
@@ -564,7 +564,22 @@ class DeepseekOCRForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> Set[str]:
         processed_weights = []
         
+        # 获取模型的目标数据类型（vLLM 通常使用 bfloat16）
+        target_dtype = None
+        
         for name, tensor in weights:
+            # 跳过 position_ids，这是一个不需要学习的缓冲区
+            if 'position_ids' in name:
+                continue
+            
+            # 确定目标数据类型（从第一个浮点权重推断）
+            if target_dtype is None and tensor.dtype in (torch.float16, torch.bfloat16, torch.float32):
+                target_dtype = torch.bfloat16  # vLLM 默认使用 bfloat16
+            
+            # 统一数据类型：将 float16 转换为 bfloat16
+            if tensor.dtype == torch.float16:
+                tensor = tensor.to(torch.bfloat16)
+                
             if 'sam_model' in name or 'vision_model' in name or 'projector' in name or 'image_newline' in name or 'view_seperator' in name:
                 new_name = name.replace('model.', '', 1)
             else:
