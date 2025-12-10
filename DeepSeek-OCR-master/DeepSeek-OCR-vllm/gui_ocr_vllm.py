@@ -625,9 +625,18 @@ class DeepSeekOCRVLLMGUI:
                 model_path = self.model_path_var.get()
                 
                 # 检查模型路径是否存在（本地模型）
-                if os.path.exists(model_path):
+                is_local_model = os.path.exists(model_path)
+                
+                if is_local_model:
                     self.log(f"📂 使用本地模型: {model_path}", "info")
                     self.log("✅ 离线模式（无需网络连接）", "info")
+                    
+                    # 🔧 关键修复：强制离线模式环境变量（必须在加载模型前设置）
+                    os.environ["HF_HUB_OFFLINE"] = "1"
+                    os.environ["TRANSFORMERS_OFFLINE"] = "1"
+                    os.environ["HF_DATASETS_OFFLINE"] = "1"
+                    
+                    logger.info("已启用离线模式")
                 else:
                     self.log(f"🔄 模型路径: {model_path}", "info")
                     self.log("⚠️  在线模式（需要网络下载，可能较慢）", "info")
@@ -635,14 +644,10 @@ class DeepSeekOCRVLLMGUI:
                 # 详细日志输出到文件
                 logger.debug(f"模型加载路径: {model_path}")
                 logger.debug(f"CUDA 设备: {os.environ.get('CUDA_VISIBLE_DEVICES', '0')}")
+                logger.debug(f"本地模型: {is_local_model}")
                 
                 # 设置CUDA设备
                 os.environ["CUDA_VISIBLE_DEVICES"] = '0'
-                
-                # 设置离线模式（如果是本地路径）
-                if os.path.exists(model_path):
-                    os.environ["HF_HUB_OFFLINE"] = "1"
-                    os.environ["TRANSFORMERS_OFFLINE"] = "1"
                 
                 if self.use_vllm:
                     # 使用 vLLM
@@ -654,19 +659,28 @@ class DeepSeekOCRVLLMGUI:
                         self.log("⚠️  警告: GPU 驱动未检测到", "warning")
                         self.log("       vLLM 可能无法运行，建议安装 NVIDIA 驱动", "warning")
                     
-                    self.llm = LLM(
-                        model=model_path,
-                        hf_overrides={"architectures": ["DeepseekOCRForCausalLM"]},
-                        block_size=256,
-                        enforce_eager=False,
-                        trust_remote_code=True, 
-                        max_model_len=8192,
-                        swap_space=0,
-                        max_num_seqs=self.max_concurrency_var.get(),
-                        tensor_parallel_size=1,
-                        gpu_memory_utilization=self.gpu_util_var.get(),
-                        dtype="bfloat16",  # 明确指定数据类型，避免 float16/bfloat16 混用
-                    )
+                    # 🔧 关键修复：为 vLLM 添加离线加载支持
+                    vllm_kwargs = {
+                        "model": model_path,
+                        "hf_overrides": {"architectures": ["DeepseekOCRForCausalLM"]},
+                        "block_size": 256,
+                        "enforce_eager": False,
+                        "trust_remote_code": True,
+                        "max_model_len": 8192,
+                        "swap_space": 0,
+                        "max_num_seqs": self.max_concurrency_var.get(),
+                        "tensor_parallel_size": 1,
+                        "gpu_memory_utilization": self.gpu_util_var.get(),
+                        "dtype": "bfloat16",
+                    }
+                    
+                    # 如果是本地模型，强制离线加载
+                    if is_local_model:
+                        vllm_kwargs["download_dir"] = None  # 不使用下载目录
+                        # vLLM 会读取环境变量 HF_HUB_OFFLINE
+                        logger.info("vLLM 使用离线模式加载本地模型")
+                    
+                    self.llm = LLM(**vllm_kwargs)
                     
                     self.model_status_label.config(text="✅ 已加载 (vLLM)", foreground="green")
                     self.log("✅ 模型加载成功！", "info")
@@ -680,10 +694,12 @@ class DeepSeekOCRVLLMGUI:
                     # 使用 HuggingFace Transformers
                     self.log("\n⏳ 正在加载模型（这可能需要几分钟）...", "info")
                     self.log("💡 加载 tokenizer...", "info", show_in_gui=False)
+                    
+                    # 🔧 修复：使用统一的本地模型判断变量
                     self.tokenizer = AutoTokenizer.from_pretrained(
                         model_path, 
                         trust_remote_code=True,
-                        local_files_only=os.path.exists(model_path)
+                        local_files_only=is_local_model  # 使用统一的本地模型判断
                     )
                     
                     self.log("💡 加载模型权重...", "info", show_in_gui=False)
@@ -691,7 +707,7 @@ class DeepSeekOCRVLLMGUI:
                         model_path,
                         trust_remote_code=True, 
                         use_safetensors=True,
-                        local_files_only=os.path.exists(model_path)
+                        local_files_only=is_local_model  # 使用统一的本地模型判断
                     )
                     
                     # 检查CUDA是否可用
